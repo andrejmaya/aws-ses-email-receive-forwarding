@@ -1,0 +1,515 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "AWS SES E-Mail Receive and Forwarding Solution"
+Parameters:
+  HostedZoneId:
+    Description: Hosted Zone Id in which a new MX record should be created
+    Type: AWS::Route53::HostedZone::Id
+  MailRecipient:
+    Description: E-Mail Id address to which all the received E-Mails will be forwarded to
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+  MailSender:
+    Description: E-Mail Id which will be used as the sender of the forwarded E-Mails
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+  OpsEmailid:
+    Description: E-Mail Id for operational notifications
+    Type: String 
+    AllowedPattern: '^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+  DomainName:
+    Description: "Domain name of emails which will be received. Example: example.com"
+    Type: String
+    MinLength: 6
+
+Resources:
+  SESRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      MaxSessionDuration: 3600
+      RoleName: !Ref 'AWS::StackName'
+  SESPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Ref AWS::StackName
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+            Resource: !Join 
+              - ''
+              - - '*'
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 'ses:SendRawEmail'
+            Resource:
+              - !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Join ['-',['sesemailreceive', !Ref 'AWS::AccountId', !Ref 'AWS::Region']]
+                  - /*
+              - !Join 
+                - ''
+                - - 'arn:aws:ses:'
+                  - !Ref 'AWS::Region'
+                  - ':'
+                  - !Ref 'AWS::AccountId'
+                  - ':identity/*'
+      Roles:
+        - !Ref SESRole
+  SESBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ['-',['sesemailreceive', !Ref 'AWS::AccountId', !Ref 'AWS::Region']]
+      LifecycleConfiguration:
+        Rules:
+          - Id: lifeCycleRuleForBucket
+            Status: Enabled
+            ExpirationInDays: 730
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      AccessControl: BucketOwnerFullControl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+        
+  SESBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      PolicyDocument:
+        Id: sesemailreceive-bucket-policy
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowSESPuts
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Join ['-',['sesemailreceive', !Ref 'AWS::AccountId', !Ref 'AWS::Region']]
+                - /*
+            Condition:
+              StringEquals:
+                'aws:Referer':
+                  - !Ref 'AWS::AccountId'
+      Bucket: !Ref SESBucket
+  SESLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - SESRole
+    Properties:
+      FunctionName: !Join ['-',[!Ref 'AWS::StackName', 'email-handler']]
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - SESRole
+        - Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import email
+          import re
+          import logging
+          from botocore.exceptions import ClientError
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          region = os.environ['Region']
+          
+          def get_message_from_s3(message_id):
+              incoming_email_bucket = os.environ['MailS3Bucket']
+              incoming_email_prefix = os.environ['MailS3Prefix'] if "MailS3Prefix" in os.environ else ""
+              if incoming_email_prefix:
+                  object_path = (incoming_email_prefix + "/" + message_id)
+              else:
+                  object_path = message_id
+              object_http_path = (f"http://s3.console.aws.amazon.com/s3/object/{incoming_email_bucket}/{object_path}?region={region}")
+          
+              # Create a new S3 client.
+              client_s3 = boto3.client("s3")
+              # Get the email object from the S3 bucket.
+              object_s3 = client_s3.get_object(Bucket=incoming_email_bucket,
+                  Key=object_path)
+              # Read the content of the message.
+              file = object_s3['Body'].read()
+              file_dict = {
+                  "file": file,
+                  "path": object_http_path
+              }
+              return file_dict
+          
+          def create_message(file_dict):
+              sender = os.environ['MailSender']
+              recipient = os.environ['MailRecipient']
+              separator = ","
+              # Parse the email body.
+              mailobject = email.message_from_string(file_dict['file'].decode('utf-8'))
+              # Create a new subject line.
+              subject_original = mailobject['Subject']
+              subject = "FW: " + subject_original    
+              from_obj = mailobject.get('From').replace("<","").replace(">","")
+              to_all_obj = separator.join(mailobject.get_all('To')).replace("<","").replace(">","")    
+              logger.info("from_obj: {}".format(from_obj))
+              logger.info("to_all_obj: {}".format(to_all_obj))    
+              # The body text of the email.
+              body_text = "The attached message was received <br />from {} <br />sent to {}. <br />This message is archived at {}".format(
+                  from_obj,
+                  to_all_obj,
+                  file_dict['path'])
+              # The file name to use for the attached message. Uses regex to remove all
+              # non-alphanumeric characters, and appends a file extension.
+              filename = re.sub('[^0-9a-zA-Z]+', '_', subject_original) + ".eml"
+              # Create a MIME container.
+              msg = MIMEMultipart()
+              # Create a MIME text part.
+              text_part = MIMEText(body_text, _subtype="html")
+              # Attach the text part to the MIME message.
+              msg.attach(text_part)
+              # Add subject, from and to lines.
+              msg['Subject'] = subject
+              msg['From'] = sender
+              msg['To'] = recipient
+              # Create a new MIME object.
+              att = MIMEApplication(file_dict["file"], filename)
+              att.add_header("Content-Disposition", 'attachment', filename=filename)
+              # Attach the file object to the message.
+              msg.attach(att)
+              message = {
+                  "Source": sender,
+                  "Destinations": recipient,
+                  "Data": msg.as_string()
+              }
+              return message
+          
+          def send_email(message):
+              aws_region = os.environ['Region']
+          # Create a new SES client.
+              client_ses = boto3.client('ses', region)
+              # Send the email.
+              try:
+                  #Provide the contents of the email.
+                  response = client_ses.send_raw_email(
+                      Source=message['Source'],
+                      Destinations=[
+                          message['Destinations']
+                      ],
+                      RawMessage={
+                          'Data':message['Data']
+                      }
+                  )
+          
+              # Display an error if something goes wrong.
+              except ClientError as e:
+                  output = e.response['Error']['Message']
+              else:
+                  output = "Email sent! Message ID: " + response['MessageId']
+          
+              return output
+          
+          def lambda_handler(event, context):
+              message_id = event['Records'][0]['ses']['mail']['messageId']
+              print(f"Received message ID {message_id}")
+              file_dict = get_message_from_s3(message_id)
+              message = create_message(file_dict)
+              result = send_email(message)
+              print(result)
+      Runtime: python3.7
+      Timeout: 200
+      Environment:
+        Variables:
+          MailRecipient: !Ref MailRecipient
+          MailS3Bucket: !Join ['-',['sesemailreceive', !Ref 'AWS::AccountId', !Ref 'AWS::Region']]
+          MailSender: !Ref MailSender
+          Region: !Ref 'AWS::Region'
+
+  SESLambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Join ['-',[!Ref 'AWS::StackName', 'email-handler']]
+      AlarmDescription: "Alarm if lambda errors out too many times"
+      AlarmActions:
+      - !Ref SESTopic
+      Namespace: "AWS/Lambda"
+      MetricName: "Errors"
+      Dimensions:
+      - Name: "FunctionName"
+        Value: !Ref SESLambdaFunction
+      Statistic: "Sum"
+      ComparisonOperator: "GreaterThanThreshold"
+      Threshold: 0
+      EvaluationPeriods: 5
+      Period: 60
+
+  SESTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Ref 'AWS::StackName'
+      TopicName: !Ref 'AWS::StackName'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref OpsEmailid
+
+  SESTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      Topics:
+        - !Ref SESTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Sid: AllowCloudWatchEvents
+            Action: 'sns:Publish'
+            Resource: !Ref SESTopic
+            Principal:
+              AWS: '*'
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref 'AWS::AccountId'             
+
+  SESLambdaFunctionInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref SESLambdaFunction
+      Principal: ses.amazonaws.com
+      
+  ReceiptRuleSet1: 
+    Type: AWS::SES::ReceiptRuleSet
+    DeletionPolicy: Retain
+    Properties: 
+      RuleSetName: !Ref 'AWS::StackName'
+  
+  ReceiptRule1:
+    Type: AWS::SES::ReceiptRule
+    DependsOn:
+      - SESBucket
+    Properties:
+      RuleSetName: !Ref 'AWS::StackName'
+      Rule:
+        Name: !Ref 'AWS::StackName'
+        Enabled: true
+        ScanEnabled: true
+        Recipients:
+          - !Ref DomainName
+        Actions:
+          - S3Action:
+              BucketName: !Join ['-',['sesemailreceive', !Ref 'AWS::AccountId', !Ref 'AWS::Region']]        
+          - LambdaAction:
+              FunctionArn: !GetAtt SESLambdaFunction.Arn
+              InvocationType: Event
+
+  CleanupBucketOnDelete:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt emptyBucketOnDeleteFunction.Arn
+      StackName: !Ref 'AWS::StackName'
+      BucketName: !Ref SESBucket
+
+  EmptyBucketOnDeleteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: 
+        ZipFile: |
+          import json, boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          logger.info("delete obj: {}".format(obj))
+                          s3.Object(bucket.name, obj.key).delete()
+
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")            
+      FunctionName: !Join ['-',[!Ref 'AWS::StackName', 'empty-bucket-on-delete']]
+      Handler: "index.lambda_handler"
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt emptyBucketOnDeleteFunctionRole.Arn  
+
+  EmptyBucketOnDeleteFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies: 
+        - PolicyName: "root"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"                
+              - Effect: "Allow"
+                Action: 
+                  - "s3:List*"
+                Resource: !Sub '${SESBucket.Arn}' 
+              - Effect: "Allow"
+                Action: 
+                  - "s3:Delete*"
+                  - "s3:List*"
+                  - "s3:Get*"                  
+                Resource: !Sub '${SESBucket.Arn}/*'            
+
+  ActiveReceiptRuleSet:
+    Type: Custom::ActiveReceiptRuleSet
+    DependsOn:
+      - CFNSESProvider    
+    Properties:
+      RuleSetName: !Ref 'ReceiptRuleSet1'
+      Region: !Ref 'AWS::Region'
+      ServiceToken: !GetAtt CFNSESProvider.Arn
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - LambdaRole
+    Properties:
+      PolicyName: CFNSESProviderPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ses:SetActiveReceiptRuleSet
+              - ses:VerifyEmailIdentity
+              - ses:DeleteVerifiedEmailAddress
+              - ses:DeleteReceiptRuleSet
+            Resource: '*'
+      Roles:
+        - !Ref 'LambdaRole'
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+  CFNSESProvider:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaRole
+      - LambdaPolicy
+    Properties:
+      Code: 
+        ZipFile: |    
+          import boto3, logging, os
+          import cfnresponse
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+            log.info(f"event:{event}")
+            try:
+              client = boto3.client('ses')          
+
+              ruleSetName = os.environ['RuleSetName']          
+              eMailToVerify = os.environ['EMailToVerify']                                 
+
+              if event['RequestType'] == 'Delete':
+                response = client.delete_verified_email_address(
+                    EmailAddress=eMailToVerify
+                )                      
+                log.info(f"delete_verified_email_address with RuleSetName:{eMailToVerify} response:{response}")     
+              elif event['RequestType'] == 'Create':
+                response = client.set_active_receipt_rule_set(
+                    RuleSetName=ruleSetName
+                )
+                log.info(f"set_active_receipt_rule_set with RuleSetName:{ruleSetName} response:{response}")     
+                
+                response = client.verify_email_identity(
+                    EmailAddress=eMailToVerify
+                )              
+                log.info(f"verify_email_identity with RuleSetName:{eMailToVerify} response:{response}")     
+
+              sendResponseCfn(event, context, cfnresponse.SUCCESS)
+            except Exception as e:
+                log.info("Exception: {}".format(e))
+                sendResponseCfn(event, context, cfnresponse.FAILED)            
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")                        
+
+      FunctionName: !Join ['-',[!Ref 'AWS::StackName', 'activate-rule-set']]
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: python3.8
+      Timeout: 30                
+      Environment:
+        Variables:
+          RuleSetName: !Ref ReceiptRuleSet1   
+          EMailToVerify: !Ref MailRecipient
+
+  mailDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId : !Ref HostedZoneId
+      Name: !Ref DomainName
+      ResourceRecords:
+      - !Sub '10 inbound-smtp.${AWS::Region}.amazonaws.com'
+      TTL: 300
+      Type: MX
