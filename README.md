@@ -6,4 +6,4 @@ CloudFormation template which automates the E-Mail receiving and forwarding logi
 * Existing Route53 Public Hosted Zone
 
 # Usage
-* Download and deploy the CloudFormation [template](./E-Mail_Receive_Forwarding_CFT.yml) in your account 
+* Download and deploy the CloudFormation [template](./E-Mail_Receive_Forwarding_CFT.yml) in your account where SES Receiving is supported (currently Ireland, N.Virginia and Oregon. See [documentation](https://docs.aws.amazon.com/ses/latest/dg/regions.html#region-receive-email)) 
